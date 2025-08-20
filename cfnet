@@ -1,0 +1,724 @@
+"""
+完全对应MATLAB CFNet的所有核心组件:
+- src/util/corr_filter.m: 相关滤波器学习
+- src/util/cross_corr.m: 交叉相关运算  
+- src/util/CropMargin.m: 边缘裁剪
+- src/util/XCorr.m: 交叉相关层
+- src/util/CorrFilter.m: 相关滤波器层
+- src/training/make_net.m: 网络构建
+- src/tracking/tracker_step.m: 跟踪步骤
+
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import math
+
+
+def generate_gaussian_label(size, sigma=1.0, device='cpu'):
+    """
+    生成高斯标签 - 对应MATLAB实现
+    基于MATLAB的fspecial('gaussian')和circ_grid函数
+    
+    Args:
+        size: (height, width) 响应图尺寸
+        sigma: 高斯函数标准差
+        device: 目标设备
+    Returns:
+        label: 2D高斯标签,峰值在中心
+    """
+    h, w = size
+    y_coords = torch.arange(h, dtype=torch.float32, device=device) - h // 2
+    x_coords = torch.arange(w, dtype=torch.float32, device=device) - w // 2
+    yy, xx = torch.meshgrid(y_coords, x_coords, indexing='ij')
+    
+    # 循环网格 - 对应MATLAB的circ_grid.m
+    yy = torch.fft.fftshift(yy)
+    xx = torch.fft.fftshift(xx)
+    
+    # 2D高斯函数
+    label = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+    return label
+
+
+def create_cosine_window(size, device='cpu', normalize=True):
+    """
+    创建余弦窗 - 完全对应MATLAB的hann窗口
+    对应MATLAB CFNet中的cosine window处理
+    
+    Args:
+        size: (height, width) 窗口尺寸
+        device: 目标设备
+        normalize: 是否归一化窗口
+    Returns:
+        window: 2D Hann/cosine窗口
+    """
+    h, w = size
+    hann_h = torch.hann_window(h, device=device)
+    hann_w = torch.hann_window(w, device=device)
+    window = hann_h.unsqueeze(1) * hann_w.unsqueeze(0)
+    
+    if normalize:
+        window = window / window.sum()
+    
+    return window
+
+
+class MulConst(nn.Module):
+    """
+    乘法常数层 - 对应MATLAB的MulConst层
+    用于应用窗口函数到特征图上
+    """
+    def __init__(self, init_value=1.0, learnable=True):
+        super(MulConst, self).__init__()
+        if learnable:
+            self.const = nn.Parameter(torch.tensor(init_value, dtype=torch.float32))
+        else:
+            self.register_buffer('const', torch.tensor(init_value, dtype=torch.float32))
+    
+    def forward(self, x):
+        return x * self.const
+
+
+class AlexNetFeature(nn.Module):
+    """
+    CFNet的AlexNet特征提取器 - 完全对应MATLAB配置
+    支持三种深度配置:shallow(Conv1), medium(Conv2), deep(Conv5)
+    """
+    def __init__(self, output_dim=32, depth='shallow'):
+        super(AlexNetFeature, self).__init__()
+        
+        if depth == 'shallow':  # CFNet Conv1
+            self.features = nn.Sequential(
+                nn.Conv2d(3, output_dim, kernel_size=11, stride=4, padding=0),
+                nn.ReLU(inplace=True),
+                nn.LocalResponseNorm(size=5, alpha=0.0001, beta=0.75, k=2),
+                nn.MaxPool2d(kernel_size=3, stride=2, padding=0),
+            )
+        elif depth == 'medium':  # CFNet Conv2
+            self.features = nn.Sequential(
+                nn.Conv2d(3, 96, kernel_size=11, stride=2, padding=0),
+                nn.ReLU(inplace=True),
+                nn.LocalResponseNorm(size=5, alpha=0.0001, beta=0.75, k=2),
+                nn.MaxPool2d(kernel_size=3, stride=2, padding=0),
+                
+                nn.Conv2d(96, output_dim, kernel_size=5, stride=1, padding=0),
+                nn.ReLU(inplace=True),
+                nn.LocalResponseNorm(size=5, alpha=0.0001, beta=0.75, k=2),
+                nn.MaxPool2d(kernel_size=3, stride=1, padding=0),
+            )
+        else:  # 'deep' - CFNet Conv5
+            self.features = nn.Sequential(
+                nn.Conv2d(3, 96, kernel_size=11, stride=2, padding=0),
+                nn.ReLU(inplace=True),
+                nn.LocalResponseNorm(size=5, alpha=0.0001, beta=0.75, k=2),
+                nn.MaxPool2d(kernel_size=3, stride=2, padding=0),
+                
+                nn.Conv2d(96, 256, kernel_size=5, stride=1, padding=0),
+                nn.ReLU(inplace=True),
+                nn.LocalResponseNorm(size=5, alpha=0.0001, beta=0.75, k=2),
+                nn.MaxPool2d(kernel_size=3, stride=1, padding=0),
+                
+                nn.Conv2d(256, 384, kernel_size=3, stride=1, padding=0),
+                nn.ReLU(inplace=True),
+                
+                nn.Conv2d(384, 384, kernel_size=3, stride=1, padding=0),
+                nn.ReLU(inplace=True),
+                
+                nn.Conv2d(384, output_dim, kernel_size=3, stride=1, padding=0),
+                nn.ReLU(inplace=True)
+            )
+        
+        self.output_dim = output_dim
+        self.depth = depth
+    
+    def forward(self, x):
+        return self.features(x)
+
+
+class CorrFilter(nn.Module):
+    """
+    相关滤波器层 - 完全对应MATLAB CorrFilter.m和corr_filter.m
+    实现闭式解相关滤波器学习
+    """
+    def __init__(self, lambda_reg=1e-3, bias=True):
+        super(CorrFilter, self).__init__()
+        self.lambda_reg = lambda_reg  # 对应MATLAB的lambda参数
+        self.bias = bias  # 对应CorrFilter.m的bias属性
+    
+    def forward(self, template_feat, gaussian_target):
+        """
+        相关滤波器学习 - 对应MATLAB corr_filter.m
+        
+        MATLAB核心算法:
+        y_f = fft2(y);
+        x_f = fft2(x);
+        k_f = 1/n*sum(conj(x_f).*x_f, 3) + opts.lambda;
+        a_f = 1/n*bsxfun(@times, y_f, 1./k_f);
+        w_f = bsxfun(@times, conj(a_f), x_f);
+        w = real(ifft2(w_f));
+        
+        Args:
+            template_feat: [B, C, H, W] 模板特征 (对应MATLAB的x)
+            gaussian_target: [B, H, W] 高斯目标 (对应MATLAB的y)
+        Returns:
+            correlation_filter: [B, C, H, W] 相关滤波器权重
+            bias_term: [B] 偏置项 (如果bias=True)
+        """
+        B, C, H, W = template_feat.shape
+        n = H * W 
+        
+        # FFT变换 
+        template_fft = torch.fft.fft2(template_feat, dim=(-2, -1))
+        target_fft = torch.fft.fft2(gaussian_target, dim=(-2, -1))
+        
+        # 扩展目标到通道维度 - 对应MATLAB的bsxfun操作
+        target_fft = target_fft.unsqueeze(1).expand(-1, C, -1, -1)
+        
+        template_power = torch.conj(template_fft) * template_fft
+        k_f = (1/n) * torch.sum(template_power, dim=1, keepdim=True) + self.lambda_reg
+        
+        # 数值稳定性修复：防止除零和NaN
+        eps = 1e-8
+        k_f = torch.clamp(k_f.real, min=eps) + 1j * torch.clamp(k_f.imag, min=-1e6, max=1e6)
+        
+        a_f = (1/n) * (target_fft / k_f)
+        
+        # 检查并处理数值异常
+        if torch.isnan(a_f).any() or torch.isinf(a_f).any():
+            print(f"警告: CorrFilter检测到数值异常，使用安全默认值")
+            print(f"  template_fft范围: [{template_fft.abs().min():.2e}, {template_fft.abs().max():.2e}]")
+            print(f"  k_f范围: [{k_f.abs().min():.2e}, {k_f.abs().max():.2e}]")
+            a_f = torch.zeros_like(target_fft)
+        
+        correlation_filter_fft = torch.conj(a_f) * template_fft
+        
+        correlation_filter = torch.fft.ifft2(correlation_filter_fft).real
+        
+        if self.bias:
+            # 简化的偏置计算 - 对应CorrFilter.m的bias输出
+            bias_term = torch.mean(correlation_filter, dim=(1, 2, 3))
+            return correlation_filter, bias_term
+        else:
+            return correlation_filter
+
+
+class CropMargin(nn.Module):
+    """
+    边缘裁剪层 - 完全对应MATLAB CropMargin.m
+    用于裁剪特征图的边缘区域
+    """
+    def __init__(self, margin=16):
+        super(CropMargin, self).__init__()
+        self.margin = margin
+        
+    def forward(self, x):
+        """
+        对应MATLAB代码: y = x(1+p:end-p, 1+p:end-p, :, :)
+        
+        Args:
+            x: [B, C, H, W] 输入特征
+        Returns:
+            y: [B, C, H-2*margin, W-2*margin] 裁剪后特征
+        """
+        if self.margin == 0:
+            return x
+            
+        p = self.margin
+        B, C, H, W = x.shape
+        
+        if H > 2*p and W > 2*p:
+            y = x[:, :, p:-p, p:-p]
+        else:
+            y = x  # 如果太小则不裁剪
+            
+        return y
+
+
+class XCorr(nn.Module):
+    """
+    交叉相关层 - 完全对应MATLAB XCorr.m和cross_corr.m
+    实现MATLAB的vl_nnconv操作
+    """
+    def __init__(self, bias=False):
+        super(XCorr, self).__init__()
+        self.bias = bias
+        
+    def forward(self, template, search, bias_term=None):
+        """
+        交叉相关运算 - 对应MATLAB cross_corr.m中的vl_nnconv
+        
+        MATLAB代码:
+        r_ = vl_nnconv(x_, z, []);
+        r_sz = [x_sz(1:2) - z_sz(1:2) + 1, 1, x_sz(4)];
+        
+        Args:
+            template: [B, C, H_t, W_t] 模板 (对应MATLAB的z)
+            search: [B, C, H_s, W_s] 搜索区域 (对应MATLAB的x)
+            bias_term: [B] 偏置项 (对应MATLAB的c)
+        Returns:
+            response: [B, 1, H_out, W_out] 相关响应
+        """
+        B, C, H_t, W_t = template.shape
+        B_s, C_s, H_s, W_s = search.shape
+        
+        assert H_t <= H_s and W_t <= W_s, \
+            f"Template {(H_t, W_t)} must be smaller than search {(H_s, W_s)}"
+        assert C == C_s, "Channel dimensions must match"
+        
+        H_out = H_s - H_t + 1
+        W_out = W_s - W_t + 1
+        
+        # vl_nnconv实现：使用卷积实现相关
+        template_flipped = template.flip(dims=[-2, -1])
+        
+        # 重塑为卷积格式 - 每个batch独立处理
+        conv_filter = template_flipped.reshape(B, C, H_t, W_t)
+        search_input = search.reshape(B, C, H_s, W_s)
+        
+        # 分组卷积 - 每个batch独立处理，避免通道错乱
+        response_list = []
+        for b in range(B):
+            # 对每个batch单独进行卷积
+            batch_response = F.conv2d(
+                search_input[b:b+1], 
+                conv_filter[b:b+1], 
+                groups=C, 
+                padding=0
+            )
+            response_list.append(batch_response)
+        
+        response = torch.cat(response_list, dim=0)  # [B, C, H_out, W_out]
+        
+        # 跨通道求和 - 对应CFNet的通道聚合
+        response = torch.sum(response, dim=1, keepdim=True)
+        
+        if self.bias and bias_term is not None:
+            response = response + bias_term.reshape(B, 1, 1, 1)
+            
+        return response
+
+
+class CFNetCorrelationLayer(nn.Module):
+    """
+    CFNet完整相关层 - 完全对应MATLAB make_net.m的网络结构
+    
+    MATLAB网络层序列:
+    1. cf_window: MulConst() - 应用窗口
+    2. cf: CorrFilter() - 学习相关滤波器  
+    3. crop_z: CropMargin() - 裁剪模板
+    4. xcorr: XCorr() - 交叉相关运算
+    """
+    def __init__(self, lambda_reg=1e-3, crop_margin=16, bias=False, window_size=None):
+        super(CFNetCorrelationLayer, self).__init__()
+        
+        # 子层 - 对应MATLAB网络结构
+        self.cf_window = MulConst(init_value=1.0, learnable=False)  # cf_window层
+        self.corr_filter = CorrFilter(lambda_reg, bias)  # cf层
+        self.crop_margin = CropMargin(crop_margin)  # crop_z层
+        self.xcorr = XCorr(bias)  # xcorr层
+        
+        self.bias = bias
+        self.window_size = window_size
+        
+        # 预计算窗口（如果指定了尺寸）
+        if window_size is not None:
+            window = create_cosine_window(window_size, normalize=True)
+            self.register_buffer('window', window)
+        else:
+            self.window = None
+        
+    def forward(self, template_feat, search_feat, gaussian_target):
+        """
+        完整的MATLAB网络前向传播流程
+        
+        MATLAB数据流:
+        in1 → cf_window → cf_example → cf → tmpl (+bias) → crop_z → tmpl_cropped → xcorr → out
+        
+        Args:
+            template_feat: [B, C, H, W] 模板特征 (对应in1)
+            search_feat: [B, C, H, W] 搜索特征 (对应in2)
+            gaussian_target: [B, H, W] 高斯目标 (对应cf_target参数)
+        Returns:
+            response: [B, 1, H_out, W_out] 相关响应
+        """
+        # 步骤1: cf_window层 - 应用窗口
+        if self.window is not None:
+            # 使用预计算的窗口
+            cf_example = template_feat * self.window.unsqueeze(0).unsqueeze(0)
+        else:
+            # 动态生成窗口
+            B, C, H, W = template_feat.shape
+            window = create_cosine_window((H, W), template_feat.device, normalize=True)
+            cf_example = template_feat * window.unsqueeze(0).unsqueeze(0)
+        
+        # 步骤2: cf层 - 学习相关滤波器
+        if self.bias:
+            tmpl, bias_term = self.corr_filter(cf_example, gaussian_target)
+        else:
+            tmpl = self.corr_filter(cf_example, gaussian_target)
+            bias_term = None
+        
+        # 步骤3: crop_z层 - 裁剪模板
+        tmpl_cropped = self.crop_margin(tmpl)
+        
+        # 步骤4: xcorr层 - 交叉相关
+        if self.bias:
+            response = self.xcorr(tmpl_cropped, search_feat, bias_term)
+        else:
+            response = self.xcorr(tmpl_cropped, search_feat)
+        
+        return response
+
+
+class CFNetTracker(nn.Module):
+    """
+    完整的CFNet跟踪器 - 包含后处理
+    对应MATLAB: src/tracking/tracker_step.m
+    """
+    def __init__(self, 
+                 lambda_reg=1e-3, 
+                 crop_margin=16,
+                 scale_penalty=0.9745,
+                 window_influence=0.176,
+                 response_up=16):
+        super(CFNetTracker, self).__init__()
+        
+        # 核心相关滤波器层
+        self.correlation_layer = CFNetCorrelationLayer(lambda_reg, crop_margin)
+        
+        # 跟踪参数 - 对应MATLAB tracker参数
+        self.scale_penalty = scale_penalty
+        self.window_influence = window_influence
+        self.response_up = response_up
+        
+    def forward(self, template_feat, search_feat, gaussian_label=None):
+        """
+        完整的跟踪前向传播
+        
+        Args:
+            template_feat: [B, C, H_t, W_t] 模板特征
+            search_feat: [B, C, H_s, W_s] 搜索特征
+            gaussian_label: [B, H_t, W_t] 高斯标签
+        Returns:
+            response: [B, 1, H_out, W_out] 最终响应图
+        """
+        # 获取原始响应图
+        raw_response = self.correlation_layer(template_feat, search_feat, gaussian_label)
+        
+        if not self.training:
+            # 推理时应用后处理
+            response = self.apply_tracking_post_processing(raw_response)
+            return response
+        else:
+            # 训练时返回原始响应
+            return raw_response
+            
+    def apply_tracking_post_processing(self, response):
+        """
+        跟踪后处理 - 对应MATLAB tracker_step.m
+        包括响应图上采样、尺度惩罚、位移窗口惩罚
+        """
+        B, C, H, W = response.shape
+        device = response.device
+        
+        # 1. 上采样响应图
+        if self.response_up > 1:
+            response_up = F.interpolate(
+                response, 
+                scale_factor=self.response_up, 
+                mode='bicubic', 
+                align_corners=False
+            )
+        else:
+            response_up = response
+            
+        # 2. 归一化
+        response_norm = response_up - response_up.min()
+        
+        # 3. 创建位移惩罚窗口
+        _, _, H_up, W_up = response_up.shape
+        window = create_cosine_window((H_up, W_up), device=device)
+        window = window.unsqueeze(0).unsqueeze(0)
+        
+        # 4. 应用窗口惩罚
+        response_norm = response_norm / response_norm.sum(dim=(-2, -1), keepdim=True)
+        response_final = ((1 - self.window_influence) * response_norm + 
+                         self.window_influence * window)
+        
+        return response_final
+
+
+class CFNet(nn.Module):
+    """
+    完整的CFNet实现 - 端到端可微分
+    """
+    def __init__(self, feature_dim=32, depth='shallow', lambda_reg=1e-3, 
+                 crop_margin=16, bias=False, use_response_head=False):
+        super(CFNet, self).__init__()
+        
+        self.feature_dim = feature_dim
+        self.depth = depth
+        
+        # 特征提取器
+        self.feature_extractor = AlexNetFeature(output_dim=feature_dim, depth=depth)
+        
+        # 相关滤波层
+        self.correlation_layer = CFNetCorrelationLayer(
+            lambda_reg=lambda_reg,
+            crop_margin=crop_margin,
+            bias=bias
+        )
+        
+        self.embed_dim = feature_dim
+        self.num_patches_search = 16 * 16
+        self.num_patches_template = 8 * 8
+        
+        # 可选的响应头
+        if use_response_head:
+            self.response_head = nn.Sequential(
+                nn.Conv2d(1, 16, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(16, 1, kernel_size=1)
+            )
+        else:
+            self.response_head = None
+        
+        # 窗口和标签参数
+        self.gaussian_sigma = 1.0
+        self.template_size = 127
+        self.search_size = 255
+        
+    def forward_backbone_features(self, template, search):
+        """提取backbone特征"""
+        template_feat = self.feature_extractor(template)
+        search_feat = self.feature_extractor(search)
+        return template_feat, search_feat
+        
+    def generate_training_labels(self, template_feat):
+        """生成训练用的高斯标签"""
+        B, C, H, W = template_feat.shape
+        gaussian_label = generate_gaussian_label(
+            (H, W), self.gaussian_sigma, template_feat.device
+        )
+        return gaussian_label.unsqueeze(0).expand(B, -1, -1)
+        
+    def compute_correlation_response(self, template_feat, search_feat, gaussian_label=None):
+        """计算端到端可微分的相关响应"""
+        
+        # 训练时生成高斯标签
+        if self.training and gaussian_label is None:
+            gaussian_label = self.generate_training_labels(template_feat)
+        elif gaussian_label is None:
+            # 推理时也需要高斯标签
+            gaussian_label = self.generate_training_labels(template_feat)
+        
+        # 执行相关滤波
+        correlation_map = self.correlation_layer(
+            template_feat, search_feat, gaussian_label
+        )
+        
+        # 可选的响应头处理
+        if self.response_head is not None:
+            response_map = self.response_head(correlation_map)
+        else:
+            response_map = correlation_map
+        
+        aux_info = {
+            'template_feat': template_feat,
+            'search_feat': search_feat,
+            'correlation_map': correlation_map,
+            'response_map': response_map,
+            'gaussian_label': gaussian_label
+        }
+        
+        # 计算训练损失
+        if self.training:
+            # 调整响应图大小以匹配标签
+            target_size = gaussian_label.shape[-2:]
+            if response_map.shape[-2:] != target_size:
+                response_resized = F.interpolate(
+                    response_map, size=target_size, 
+                    mode='bilinear', align_corners=False
+                )
+            else:
+                response_resized = response_map
+                
+            aux_info['cfnet_mse_loss'] = F.mse_loss(
+                response_resized, gaussian_label.unsqueeze(1)
+            )
+            
+        return correlation_map, aux_info
+        
+    def format_output_for_ortrack(self, correlation_map, aux_info):
+        B, C, H, W = correlation_map.size()
+        
+        # 转换为特征序列
+        correlation_patches = correlation_map.reshape(B, C, H * W).transpose(1, 2)
+        
+        # 扩展维度（如果需要）
+        if C != self.embed_dim:
+            expand_layer = nn.Linear(C, self.embed_dim).to(correlation_map.device)
+            correlation_patches = expand_layer(correlation_patches)
+        
+        # 添加CLS token
+        cls_token = torch.zeros(B, 1, self.embed_dim, device=correlation_map.device)
+        combined_feat = torch.cat([cls_token, correlation_patches], dim=1)
+        
+        # 构建aux_dict
+        aux_dict = {
+            'response_map': aux_info['response_map'],
+            'cfnet_correlation_map': correlation_map,
+            'cfnet_template_feat': aux_info['template_feat'],
+            'cfnet_search_feat': aux_info['search_feat'],
+            'cfnet_gaussian_label': aux_info['gaussian_label']
+        }
+        
+        # 添加训练损失
+        if 'cfnet_mse_loss' in aux_info:
+            aux_dict['cfnet_mse_loss'] = aux_info['cfnet_mse_loss']
+            
+        return combined_feat, aux_dict
+        
+    def forward(self, z=None, x=None, mode='test', **kwargs):
+        """
+        CFNet主要前向传播
+        
+        Args:
+            z: [B, 3, H_t, W_t] template images
+            x: [B, 3, H_s, W_s] search images
+            mode: 'train' or 'test'
+        Returns:
+            combined_feat: [B, N+1, C] ORTrack兼容特征
+            aux_dict: CFNet特定信息
+        """
+        if z is None or x is None:
+            raise ValueError("CFNet requires both template (z) and search (x) inputs")
+            
+        # 1. 特征提取
+        template_feat, search_feat = self.forward_backbone_features(z, x)
+        
+        # 2. 相关滤波
+        correlation_map, aux_info = self.compute_correlation_response(
+            template_feat, search_feat
+        )
+        
+        # 3. 输出格式化
+        combined_feat, aux_dict = self.format_output_for_ortrack(correlation_map, aux_info)
+        
+        return combined_feat, aux_dict
+
+
+# ============================================================================
+# 构建函数 - 对应不同的CFNet配置
+# ============================================================================
+
+def build_cfnet_tiny(num_classes=0, pretrained=False, **kwargs):
+    """
+    构建CFNet Conv1层实现 - 轻量级版本
+    
+    Args:
+        num_classes: 分类数量（CFNet中不使用）
+        pretrained: 是否使用预训练权重
+        **kwargs: 其他参数
+    Returns:
+        model: CFNet模型实例
+    """
+    model = CFNet(
+        feature_dim=32,
+        depth='shallow',
+        lambda_reg=1e-3,
+        crop_margin=16,
+        bias=False,
+        use_response_head=False
+    )
+    
+    if pretrained:
+        print("Warning: CFNet pretrained weights not available")
+        print("Recommend training from scratch with end-to-end pipeline")
+        
+    return model
+
+
+def build_cfnet_small(num_classes=0, pretrained=False, **kwargs):
+    """
+    构建CFNet Conv2层实现 - 标准版本
+    
+    Args:
+        num_classes: 分类数量（CFNet中不使用）
+        pretrained: 是否使用预训练权重
+        **kwargs: 其他参数
+    Returns:
+        model: CFNet模型实例
+    """
+    model = CFNet(
+        feature_dim=32,
+        depth='medium',
+        lambda_reg=1e-3,
+        crop_margin=16,
+        bias=False,
+        use_response_head=False
+    )
+    
+    if pretrained:
+        print("Warning: CFNet pretrained weights not available")
+        print("Recommend training from scratch with end-to-end pipeline")
+        
+    return model
+
+
+def build_cfnet_base(num_classes=0, pretrained=False, **kwargs):
+    """
+    构建CFNet Conv5层实现 - 完整版本
+    
+    Args:
+        num_classes: 分类数量（CFNet中不使用）
+        pretrained: 是否使用预训练权重
+        **kwargs: 其他参数
+    Returns:
+        model: CFNet模型实例
+    """
+    model = CFNet(
+        feature_dim=32,
+        depth='deep',
+        lambda_reg=1e-3,
+        crop_margin=16,
+        bias=False,
+        use_response_head=False
+    )
+    
+    if pretrained:
+        print("Warning: CFNet pretrained weights not available")
+        print("Training from scratch enables full end-to-end representation learning")
+        
+    return model
+
+
+def create_cfnet_model(config='base', pretrained_path=None):
+    """
+    创建完整的CFNet模型 - 统一接口
+    
+    Args:
+        config: 模型配置 ('tiny', 'small', 'base')
+        pretrained_path: 预训练权重路径
+    Returns:
+        model: 完整的CFNet模型
+    """
+    if config == 'tiny':
+        model = build_cfnet_tiny()
+    elif config == 'small':
+        model = build_cfnet_small()
+    elif config == 'base':
+        model = build_cfnet_base()
+    else:
+        raise ValueError(f"Unknown config: {config}")
+    
+    if pretrained_path:
+        checkpoint = torch.load(pretrained_path, map_location='cpu')
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"Loaded pretrained weights from {pretrained_path}")
+    
+    return model
+
